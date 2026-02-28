@@ -1,0 +1,343 @@
+#!/bin/bash
+set -euo pipefail
+shopt -s lastpipe
+
+readonly script_path="$(readlink -f ${BASH_SOURCE[0]})"
+readonly script_dir="$(dirname $(readlink -f ${BASH_SOURCE[0]}))"
+
+##
+## COMMON PART
+##
+_is_iteractive(){
+   test -t 0  ## Standard input is a terminal (likely interactive)
+   #tty -s && echo "This shell is interactive
+   #test -n "$PS1" && "This shell is interactive"
+   #case "$-" in  *i*) echo "This shell is interactive" ;; esac
+   #if [[ $- == *i* ]]; then  echo "This shell is interactive"
+}
+_is_sourced(){
+   [[ "${BASH_SOURCE[0]}" == "${0}" ]]
+}
+
+_var_is_set(){
+   declare -rn var=$1
+   ! test -z ${var+x}
+}
+_var_is_set_not_empty(){
+   declare -rn var=$1
+   ! test -z ${var:+x}
+}
+_var_is_unset(){
+   declare -rn var=$1
+   test -z ${var+x}
+}
+_var_is_unset_or_empty(){
+   declare -rn var=$1
+   test -z ${var:+x}
+}
+##
+## END COMMON PART
+##
+
+
+##
+## PREPARATION PART
+##
+exec 0>&- ## close stdin => protect unexpected request for user input
+cd $(mktemp -d -p $XDG_RUNTIME_DIR -t $(basename $script_path).XXX)
+echo >&2 --------- $PWD
+trap 'rm -rf $PWD' EXIT
+##
+## END PREPARATION PART
+##
+
+
+##
+## COMMAND LINE COMMON PART
+##
+readonly subcommand_pattern='[A-Za-z][A-Za-z0-9_-]*'
+readonly option_pattern='--*[A-Za-z0-9][A-Za-z0-9_-]*'
+readonly internal_pattern='_[A-Za-z0-9][A-Za-z0-9_-]*'
+_list_subcommands(){
+   grep -Po '^[A-Za-z][A-Za-z0-9_-]*(?=\(\))' <"$script_path"
+}
+_list_options(){
+   grep -Po '^-[A-Za-z0-9][A-Za-z0-9_-]*(?=\(\))' <"$script_path"
+}
+_list_internals(){
+   grep -Po '^_[A-Za-z0-9][A-Za-z0-9_-]*(?=\(\))' <"$script_path"
+}
+_is_option(){
+   grep -Pq "^$option_pattern(=|$)"
+}
+_todo(){
+   echo >&2 "  UNDER CONSTRUCTION!   " "$@"
+   exit 2
+}
+-x(){
+   set -x
+}
+--debug(){
+   echo >&2 '!!! todo --debug'
+}
+##
+## END COMMAND LINE COMMON PART
+##
+
+
+_curl(){
+   curl -fsSL "$@"
+}
+_url_to_filename(){
+   sed -nE -e's,https://(.*),\1,' -e's,/,-,gp'
+}
+
+details(){
+   _curl https://ollama.com/library/${1:?model name required} | htmlq '#readme' -r.hidden | _render
+}
+
+downloaded(){
+   ollama list "$@"
+}
+_search_url(){
+   echo 'https://ollama.com/search?q='"$1""&$(shift;IFS='&';echo "$*")"
+   ## increase page=N till "No models found." in main
+   ## filters o=newest o=popular &c=cloud&c=embedding&c=vision c=tools c=thinking
+}
+
+_search_one(){
+   while (($#)) ;do
+      if _is_option <<<"$1"
+      then "$@"  ## execute option
+      else break
+      fi
+      shift
+   done
+   echo >&2 ------------ "$(_search_url "$@")"
+   _curl "$(_search_url "$@")" | htmlq '#searchresults'
+}
+_search_more(){
+   local -i iter=1
+   local -i num=1
+   local -i maxpage=${maxpage:-1}
+   local -i maxnum=${maxnum:-200}
+   _search_one "$@" page=${page:-1} | _get_list >list
+   show_page
+   while ((iter<999))
+   do
+      cat list|_get_item $iter >item
+      test -s item || break
+      if page=$(cat item | _next_page)
+      then
+         if ((page>maxpage)) ;then break; fi
+         _search_one "$@" page=$page | _get_list >list
+         show_page
+         iter=1
+         continue
+      else
+         show_item #{ echo "$num "; show_item; } | { tr '\n' '\t'; echo; } || { echo >&2 !!! EMPTY item; }
+      fi
+      ((iter++))
+      ((num++))
+      if ((num>maxnum)); then break; fi
+   done
+   # echo end-- $iter $num
+}
+_subcommand_options(){
+   local subcommand=$1
+   shift
+   declare -f $subcommand | sed -nEe '/^\{/,/^\}/{//!p;}' | grep -Po "$@" '^\s*(function )?\K-+[A-Za-z][A-Za-z_0-9]*?(?= \(\))'
+}
+_is_subcommand_option(){
+   _subcommand_options $1 | { shift; grep -Fq -- $@; }
+}
+search(){
+   ## todo update filters from search page attributes body.main.form
+   local url=
+   local -i maxpage=1
+   local -i maxnum
+   local query
+   local header=$'N\ttitle\thref\tpulls\ttags\tcapabilities\tsizes\tupdated'
+   --help(){
+      cat <<END
+$(basename $script_path) search <keyword> [$(_subcommand_options search |xargs|tr ' ' ,)]
+END
+      exit
+   }
+   --newest(){    url+=" o=newest"; }
+   --popular(){   url+=" o=popular"; }
+   --cloud(){     url+=" c=cloud"; }
+   --embedding(){ url+=" c=embeddig"; }
+   --vision(){    url+=" c=vision"; }
+   --tools(){     url+=" c=tools"; }
+   --thinking(){  url+=" c=thinking"; }
+   --page(){      url+=" page=$1"; maxpage=1; shifter=2; }
+   --maxpage(){   maxpage=${1?set maximum number of pages}; shifter=2; }
+   --max(){       maxnum=${1?set limit of entries}; maxpage=99; shifter=2; }
+   --table(){     formatize(){ cat <(header) - | column -ts$'\t' | pager; }  }
+   --tsv(){       formatize(){ cat; }  }
+   --nopager(){   pager(){ cat; };  }
+   --renderhtml(){   show_page(){ <list _render; }; show_item(){ :; };   }
+   --html(){          --renderhtml "$@"; }
+   --rawhtml(){      show_item(){ cat item; }; }
+   --description(){ __get_short_description(){ _get_short_description; }; header+=$'\tdescription';}
+   __get_short_description(){ :; }
+   header(){ echo "$header"; echo "$header" | sed -E 's,[^\t]+,---,g'; }
+   render(){ cat; }
+   pager(){ bat -psS; }
+   --table  ## set default
+   _is_search_option(){
+      _is_subcommand_option search "$@"
+   }
+   show_item_one(){
+      <item _get_title
+      <item _get_href;echo
+      <item _get_pull_count
+      <item _get_tag_count
+      <item _get_capability | xargs | tr ' ' ,
+      <item _get_size | xargs | tr ' ' ,
+      <item _get_updated_time
+      <item __get_short_description | head -c 200;
+   }
+   show_item(){
+      { echo "$num "; show_item_one; } | { tr '\n' '\t'; echo; }
+   }
+   show_page(){
+      :;
+   }
+   while (($#)) ;do
+      local -i shifter=1
+      case "$1" in
+         -*)
+            if _is_search_option "$1"
+            then "$@"  ## execute option
+            else 
+               echo >&2 "wrong option '$1' for command search, use one of $(_subcommand_options search |xargs)"
+               return 1
+            fi
+            ;;
+         *) test "${query:-}" = '' || echo >&2 "query '$query' is non-option argument to be set once, overridden"
+            query="$1"
+            ;;
+      esac
+      shift $shifter
+   done
+   _search_more ${query:?required, what to search?} $url | formatize
+}
+_get_list(){
+   htmlq 'ul[role=list]'
+}
+_get_item(){
+   htmlq "li:nth-child($1)"
+}
+_get_title(){
+   htmlq -t 'span[x-test-search-response-title]'
+}
+_get_href(){
+   printf "%s%s " https://ollama.com $(htmlq -a href 'a')
+}
+_get_short_description(){
+   htmlq -t 'p.max-w-lg'
+}
+_get_pull_count(){
+   htmlq -t 'span[x-test-pull-count]'
+}
+_get_tag_count(){
+   htmlq -t 'span[x-test-tag-count]'
+}
+_get_updated_time(){
+   htmlq -t 'span[x-test-updated]'
+}
+_get_capability(){
+   htmlq -t 'span[x-test-capability]'
+}
+_get_size(){
+   htmlq -t 'span[x-test-size]'
+}
+_next_page(){
+   htmlq 'li[hx-get]'|grep -Po 'hx-get="/search\?page=\K\d+'
+}
+
+_render(){
+   bunx cli-html
+   ## also could be any other command to run nodejs cli program npx, pnpmx, yarnx, etc
+}
+
+help(){
+   cat <<END
+$(basename $script_path): search models in ollama library on the web https://ollama.com/search
+usage: $(basename $script_path) <keyword>
+       $($script_path search --help)
+       $(basename $script_path) details <model_name>  :  show readme from page https://ollama.com/library/model_name
+       $(basename $script_path) downloaded            :  alias to ollama list
+       $(basename $script_path) dependancies          :  list of deps to be installed
+       $(basename $script_path) -h,--help
+       $(basename $script_path) -x,--debug
+subcommands: $(_list_subcommands|xargs)
+END
+   exit
+}
+--help(){
+   help
+}
+-help(){
+   --help
+}
+-h(){
+   --help
+}
+
+dependancies(){
+   cat <<END
+htmlq v0.4.0+ https://github.com/mgdm/htmlq
+cli-html
+bash v5+
+END
+}
+
+_main(){
+   _check_requirements
+   if (($#==0))
+   then 
+      help
+      exit 1
+   fi
+   while (($#)) ;do
+      if _is_option <<<"$1"
+      then "$@"
+      else break
+      fi
+      ##todo shift2 if option consumes 2nd argument as value
+      shift
+   done
+   # local subcommand=${1?subcommand must be set} ##todo ||help>&2 && exit0
+   # local subcommand=${1:-search}
+   # shift || true
+   if grep -q '^[A-Za-z][A-Za-z0-9_-]*$' <<<"${1:-}" \
+      && _list_subcommands | grep -q "^${1:-}$"
+   then "$@"
+   else search "$@"
+      #echo >&2 "subcommand '$subcommand' is not valid, use one of: $(_list_subcommands|xargs)"  ##todo help
+   fi
+}
+
+_check_requirement(){
+   "$1" --version 2>&1 >/dev/null || {
+      echo >&2 "FATAL: $1 version $2 ${@:3} required"
+      false
+   }
+}
+_check_requirements(){
+   local -i fai=0
+   _check_requirement htmlq 0.4.0 || ((++fai))
+   _check_requirement sed 4 || ((++fai))
+   _check_requirement grep 3 with PCRE2 || ((++fai))
+   #ollama optional
+   #bat optional
+   #column optional
+   return $fai
+}
+
+if _is_sourced
+then _main "$@"
+fi
